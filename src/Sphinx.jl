@@ -14,5 +14,7 @@ include("tools/web3_tools.jl")
 include("agents/voter_agent.jl")
 include("agents/signer_agent.jl")
 include("agents/reader_agent.jl")
-export AIAgent, NeuralNetModel, step!, create_blockchain_env, update_environment!, read_blockchain_data, submit_transaction, submit_vote_to_contract, run_server
+include("agents/trading_agent.jl")
+include("agents/governance_agent.jl")
+export AIAgent, NeuralNetModel, step!, create_blockchain_env, update_environment!, read_blockchain_data, submit_transaction, submit_vote_to_contract, run_server, call_smart_contract
 end
