@@ -1,80 +1,109 @@
-using Random
-using Flux
-using Flux: onehotbatch, onecold, mse, train!
+import * as tf from '@tensorflow/tfjs';
+import { AIAgent, NeuralNetModel, callTEESecureFunction } from '../core/agent';
+import { submitTransaction, submitVoteToContract, fetchSwarmData } from '../web3/blockchain';
+import { randomVotingModel, blockHeightVotingModel, tradingModel, governanceModel, signTransaction } from './decisionModels';
 
-function random_voting_model(agent::AIAgent, env::Dict)
-    return rand(Bool)
-end
+// New: Analyze emergent behavior at the swarm level
+export interface EmergentBehavior {
+  votingConsensus?: { approveRatio: number; totalVotes: number };
+  marketTrend?: { buyRatio: number; totalTrades: number };
+  governanceApproval?: { approvalRatio: number; totalDecisions: number };
+}
 
-function block_height_voting_model(agent::AIAgent, env::Dict)
-    block_height = env["block_height"]
-    return block_height % 2 == 0
-end
+async function extractFeatures(agent: AIAgent, env: Record<string, any>, agents: AIAgent[]): Promise<number[]> {
+  const blockHeight = env.blockHeight || 0;
+  const pastVotes = Object.values(env.consensus || {});
+  const voteRatio = pastVotes.length > 0 ? pastVotes.filter(v => v === 'eurt').length / pastVotes.length : 0.5;
+  const actionCount = agent.state.vote ? 1 : 0;
 
-function sign_transaction(tx_data::String)
-    secure_data = call_tee_secure_function(tx_data * "_signature")
-    return secure_data
-end
+  // New: Influence from other agents' historical behavior
+  const peerInfluence = agents
+    .filter(a => a.id !== agent.id && (a.role === agent.role || a.role === 'voter' || a.role === 'trader' || a.role === 'governor'))
+    .map(a => a.getHistoricalActions(agent.role === 'trader' ? 'trade' : agent.role === 'voter' ? 'vote' : 'decision'))
+    .flat()
+    .reduce((acc: number, action: any) => acc + (action === 'buy' || action === true || action === 'approve' ? 1 : -1), 0);
 
-function extract_features(agent::AIAgent, env::Dict)
-    block_height = Float32(env["block_height"])
-    past_votes = values(env["consensus"])
-    vote_ratio = length(past_votes) > 0 ? Float32(sum(v == "eurt" for v in past_votes) / length(past_votes)) : 0.5f0
-    return [block_height, vote_ratio]
-end
+  const influenceFactor = peerInfluence / Math.max(1, agents.length - 1);
+  return [blockHeight, voteRatio, actionCount, influenceFactor, env.blockHeight ? 1 : 0]; // Updated for ABM
+}
 
-function neural_net_voting_model(agent::AIAgent, env::Dict, nn_model::NeuralNetModel)
-    features = extract_features(agent, env)
-    probs = nn_model.model(features)
-    decision = onecold(probs, [false, true])
-    push!(nn_model.history, (features, decision))
-    if length(nn_model.history) >= 10
-        train_neural_net!(nn_model)
-    end
-    return decision
-end
+async function neuralNetVotingModel(agent: AIAgent, env: Record<string, any>, nnModel: NeuralNetModel, agents: AIAgent[]): Promise<boolean> {
+  const features = await extractFeatures(agent, env, agents);
+  const inputTensor = tf.tensor2d([features]);
+  const probs = nnModel.model.predict(inputTensor) as tf.Tensor;
+  const decision = (await probs.argMax(1).data())[0] === 1;
+  nnModel.history.push([features, decision]);
+  
+  if (nnModel.history.length >= 10) {
+    await trainNeuralNet(nnModel);
+  }
+  return decision;
+}
 
-function train_neural_net!(nn_model::NeuralNetModel)
-    if length(nn_model.history) < 2
-        return
-    end
-    features = [h[1] for h in nn_model.history]
-    labels = [h[2] for h in nn_model.history]
-    x = hcat(features...)
-    y = onehotbatch(labels, [false, true])
-    loss(x, y) = mse(nn_model.model(x), y)
-    opt = ADAM(0.01)
-    data = [(x, y)]
-    for epoch in 1:5
-        train!(loss, params(nn_model.model), data, opt)
-    end
-    empty!(nn_model.history)
-    println("Trained neural network with $(length(labels)) samples")
-end
+async function trainNeuralNet(nnModel: NeuralNetModel): Promise<void> {
+  if (nnModel.history.length < 2) return;
 
-function step!(agent::AIAgent, env::Dict)
-    decision = if !isnothing(agent.nn_model) && agent.role == "voter"
-        neural_net_voting_model(agent, env, agent.nn_model)
-    else
-        agent.decision_model(agent, env)
-    end
-    
-    if agent.role == "voter"
-        secure_vote = call_tee_secure_function(string(decision))
-        agent.state["vote"] = secure_vote
-        tx_hash = submit_vote_to_contract(secure_vote)
-        agent.state["tx_hash"] = tx_hash
-        println("Agent $(agent.id) voted securely: $(secure_vote), tx: $tx_hash")
-    elseif agent.role == "signer"
-        tx_data = get(env, "transaction", "default_tx")
-        signature = sign_transaction(tx_data)
-        agent.state["signature"] = signature
-        tx_hash = submit_transaction(signature)
-        agent.state["tx_hash"] = tx_hash
-        println("Agent $(agent.id) signed transaction: $signature, tx: $tx_hash")
-    elseif agent.role == "reader"
-        block_height = read_blockchain_data()
-        agent.state["block_height"] = block_height
-        println("Agent $(agent.id) read block height: $block_height")
-    end
-end
+  const features = nnModel.history.map(h => h[0]);
+  const labels = nnModel.history.map(h => h[1] ? [0, 1] : [1, 0]);
+  const xs = tf.tensor2d(features);
+  const ys = tf.tensor2d(labels);
+
+  let patienceCounter = 0;
+  for (let epoch = 0; epoch < 20; epoch++) {
+    const history = await nnModel.model.fit(xs, ys, { epochs: 1, verbose: 0 });
+    const currentLoss = history.history.loss[0] as number;
+    if (currentLoss < nnModel.bestLoss) {
+      nnModel.bestLoss = currentLoss;
+      patienceCounter = 0;
+    } else {
+      patienceCounter++;
+    }
+    if (patienceCounter >= 3) {
+      console.log(`Early stopping at epoch ${epoch} with loss ${currentLoss}`);
+      break;
+    }
+  }
+  nnModel.history = [];
+  console.log(`Trained neural network with ${labels.length} samples, final loss: ${nnModel.bestLoss}`);
+}
+
+export async function sendMessage(agent: AIAgent, env: Record<string, any>, message: string): Promise<void> {
+  if (!env.messages) env.messages = {};
+  if (!env.messages[agent.id]) env.messages[agent.id] = [];
+  env.messages[agent.id].push(message);
+  console.log(`Agent ${agent.id} sent message: ${message}`);
+}
+
+export async function receiveMessages(agent: AIAgent, env: Record<string, any>): Promise<string[]> {
+  if (!env.messages) return [];
+  const messages: string[] = [];
+  for (const senderId in env.messages) {
+    if (parseInt(senderId) !== agent.id) {
+      messages.push(...env.messages[senderId]);
+    }
+  }
+  return messages;
+}
+
+// New: Elect a leader for swarm coordination
+export async function electLeader(agents: AIAgent[]): Promise<AIAgent> {
+  return agents.reduce((leader, agent) => {
+    const leaderScore = leader.actionHistory.reduce((sum, entry) => sum + (entry.outcome === 'success' ? 1 : 0), 0);
+    const agentScore = agent.actionHistory.reduce((sum, entry) => sum + (entry.outcome === 'success' ? 1 : 0), 0);
+    return agentScore > leaderScore ? agent : leader;
+  }, agents[0]);
+}
+
+// New: Analyze emergent behavior in the swarm
+export async function analyzeEmergentBehavior(agents: AIAgent[]): Promise<EmergentBehavior> {
+  const voterAgents = agents.filter(a => a.role === 'voter' || a.role === 'governor');
+  const tradingAgents = agents.filter(a => a.role === 'trader');
+  const governanceAgents = agents.filter(a => a.role === 'governor');
+
+  const votingConsensus = voterAgents.length > 0 ? {
+    approveRatio: voterAgents.reduce((sum, a) => sum + (a.getHistoricalActions('vote').filter(v => v === true).length), 0) / (voterAgents.length * 10),
+    totalVotes: voterAgents.reduce((sum, a) => sum + a.getHistoricalActions('vote').length, 0)
+  } : undefined;
+
+  const marketTrend = tradingAgents.length > 0 ? {
+    buyRatio: tradingAgents.reduce((sum, a) => sum + (a.getHistoricalActions('trade').filter(t =>
