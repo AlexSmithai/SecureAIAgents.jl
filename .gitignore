@@ -1,6 +1,4 @@
 node_modules/
 dist/
 build/
-*.js  # Ignore compiled .js files
-!src/**/*.js  # Allow .js files in src/ if they are meant to be there
 *.ji  # Allow .ji files for JuliaOS integration
