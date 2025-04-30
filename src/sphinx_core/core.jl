@@ -1,58 +1,128 @@
-mutable struct AIAgent
-    id::Int
-    role::String
-    state::Dict
-    decision_model::Function
-    nn_model::Union{NeuralNetModel, Nothing}
+import * as tf from '@tensorflow/tfjs';
+import * as fs from 'fs';
+import { spawnSync } from 'child_process';
+import { mcpClient, MCPResponse } from '../web3/mcpClient';
 
-    function AIAgent(id::Int, role::String, decision_model::Function, use_nn::Bool=false)
-        state = Dict("key" => "", "vote" => nothing, "tx_hash" => nothing, "block_height" => 0, "balance" => 0.0)
-        nn_model = use_nn ? NeuralNetModel() : nothing
-        new(id, role, state, decision_model, nn_model)
-    end
-end
+export class NeuralNetModel {
+  model: tf.LayersModel;
+  history: Array<[number[], boolean]>;
+  bestLoss: number;
 
-mutable struct NeuralNetModel
-    model::Chain
-    history::Vector{Tuple{Vector{Float32}, Bool}}
-end
+  constructor() {
+    this.model = tf.sequential();
+    this.model.add(tf.layers.dense({ units: 20, activation: 'relu', inputShape: [5] })); // Increased input shape for ABM features
+    this.model.add(tf.layers.dense({ units: 10, activation: 'relu' }));
+    this.model.add(tf.layers.dense({ units: 2, activation: 'softmax' }));
+    this.model.compile({ optimizer: 'adam', loss: 'categoricalCrossentropy', metrics: ['accuracy'] });
+    this.history = [];
+    this.bestLoss = Infinity;
+  }
+}
 
-function NeuralNetModel()
-    model = Chain(
-        Dense(2, 10, relu),
-        Dense(10, 2),
-        softmax
-    )
-    history = Vector{Tuple{Vector{Float32}, Bool}}()
-    return NeuralNetModel(model, history)
-end
+export class AIAgent {
+  id: number;
+  role: string;
+  state: Record<string, any>;
+  decisionModel: (agent: AIAgent, env: Record<string, any>) => Promise<boolean | string>;
+  nnModel: NeuralNetModel | null;
+  priority: number;
+  mcpContext: Record<string, MCPResponse>;
+  actionHistory: Array<{ step: number; action: any; outcome: any }>; // New: Track agent history for ABM
 
-function call_tee_secure_function(input::String)
-    lib_path = joinpath(@__DIR__, "../../lib/libteec.so")  # Use OP-TEE's libteec
-    lib = try
-        Libdl.dlopen(lib_path)
-    catch e
-        # Fallback to simulated TEE if OP-TEE library is not available
-        lib_path = joinpath(@__DIR__, "../../lib/libtee.so")
-        Libdl.dlopen(lib_path)
-    end
+  constructor(
+    id: number,
+    role: string,
+    decisionModel: (agent: AIAgent, env: Record<string, any>) => Promise<boolean | string>,
+    useNN: boolean = false,
+    priority: number = 0
+  ) {
+    this.id = id;
+    this.role = role;
+    this.state = { key: '', vote: null, txHash: null, blockHeight: 0, balance: 0.0 };
+    this.decisionModel = decisionModel;
+    this.nnModel = useNN ? new NeuralNetModel() : null;
+    this.priority = priority;
+    this.mcpContext = {};
+    this.actionHistory = []; // Initialize action history
+  }
 
-    sym = try
-        Libdl.dlsym(lib, :TEEC_InvokeCommand)  # OP-TEE API
-    catch e
-        # Fallback to simulated function
-        Libdl.dlsym(lib, :tee_secure_process)
-    end
+  // New: Record an action and its outcome for ABM
+  recordAction(step: number, action: any, outcome: any): void {
+    this.actionHistory.push({ step, action, outcome });
+    if (this.actionHistory.length > 100) {
+      this.actionHistory.shift(); // Keep history manageable
+    }
+  }
 
-    result_ptr = try
-        # Simulate OP-TEE command invocation (simplified for this example)
-        ccall(sym, Cstring, (Cstring,), input)
-    catch e
-        Libdl.dlclose(lib)
-        error("Failed to call TEE function: $e")
-    end
+  // New: Get historical actions for a specific type (e.g., votes, trades)
+  getHistoricalActions(type: 'vote' | 'trade' | 'decision'): Array<any> {
+    return this.actionHistory
+      .filter(entry => {
+        if (type === 'vote' && (this.role === 'voter' || this.role === 'governor')) return true;
+        if (type === 'trade' && this.role === 'trader') return true;
+        if (type === 'decision' && this.role === 'governor') return true;
+        return false;
+      })
+      .map(entry => entry.action);
+  }
 
-    result = unsafe_string(result_ptr)
-    Libdl.dlclose(lib)
-    return result
-end
+  async fetchMCPContext(chain: string, type: 'votes' | 'market' | 'proposals', params: any = {}): Promise<void> {
+    let response: MCPResponse;
+    if (type === 'votes' || type === 'transactions') {
+      response = await mcpClient.fetchHistoricalData(chain, type, params);
+    } else if (type === 'market') {
+      response = await mcpClient.fetchMarketData(chain, params.token);
+    } else {
+      response = await mcpClient.fetchGovernanceProposals(chain, params.contractAddress);
+    }
+    this.mcpContext[type] = response;
+  }
+
+  async step(env: Record<string, any>): Promise<void> {
+    // Defined in engine.ts
+  }
+}
+
+export function callTEESecureFunction(input: string): string {
+  const result = spawnSync('node', [
+    '-e',
+    `const ffi = require('ffi-napi');` +
+    `const lib = ffi.Library('lib/libtee', { 'tee_secure_process': ['string', ['string']] });` +
+    `console.log(lib.tee_secure_process('${input}'));`
+  ], { encoding: 'utf8' });
+
+  if (result.error) {
+    throw new Error(`Failed to call TEE function: ${result.error.message}`);
+  }
+
+  const output = result.stdout.trim();
+  return output || input.split('').reverse().join('');
+}
+
+export function saveState(agent: AIAgent, filepath: string): void {
+  const stateDict = {
+    id: agent.id,
+    role: agent.role,
+    state: agent.state,
+    history: agent.nnModel ? agent.nnModel.history : [],
+    mcpContext: agent.mcpContext,
+    actionHistory: agent.actionHistory // Save action history
+  };
+  fs.writeFileSync(filepath, JSON.stringify(stateDict, null, 2));
+  console.log(`Saved agent ${agent.id} state to ${filepath}`);
+}
+
+export function loadState(agent: AIAgent, filepath: string): void {
+  if (!fs.existsSync(filepath)) {
+    console.warn(`State file ${filepath} not found for agent ${agent.id}`);
+    return;
+  }
+  const stateDict = JSON.parse(fs.readFileSync(filepath, 'utf8'));
+  agent.state = stateDict.state;
+  if (agent.nnModel) {
+    agent.nnModel.history = stateDict.history;
+  }
+  agent.mcpContext = stateDict.mcpContext || {};
+  agent.actionHistory = stateDict.actionHistory || [];
+  console.log(`Loaded agent ${agent.id} state from ${filepath}`);
+}
