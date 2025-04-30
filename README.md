@@ -1,6 +1,6 @@
 # Sphinx.jl
 
-A Julia framework for creating Web3-friendly AI agents with secure operations using Trusted Execution Environments (TEEs). Inspired by the Elaria engine and Web3 AI frameworks like Eliza.
+A Julia framework for creating Web3-friendly AI agents with secure operations using Trusted Execution Environments (TEEs). Inspired by the Elaria engine and Web3 AI frameworks 
 
 ## Features
 - **Web3 Integration**: Read blockchain data, submit transactions, and interact with smart contracts.
