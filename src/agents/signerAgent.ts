@@ -158,4 +158,78 @@ const swarmCooperationPlugin: AgentPlugin = {
 // Plugin for transaction analytics
 const analyticsPlugin: AgentPlugin = {
   onStep: async (agent: AIAgent, env: Record<string, any>, agents: AIAgent[]) => {
-    try
+    try {
+      const analytics: TransactionAnalytics = agent['analytics'] || {
+        totalSigned: 0,
+        totalFailed: 0,
+        averageGasCost: 0,
+        successRate: 0,
+        highValueTxCount: 0,
+      };
+      const state: SignerState = agent['state'].signerState || {
+        lastTxHash: null,
+        pendingTransactions: [],
+        peerActivity: {},
+        transactionVolume: 0,
+        cooperationScore: 0,
+        gasEstimates: {},
+        successRate: 0,
+      };
+
+      // Update analytics based on historical actions
+      const signedTxs = agent['getHistoricalActions']('sign');
+      analytics.totalSigned = signedTxs.length;
+      analytics.totalFailed = signedTxs.filter(tx => !tx.includes('success')).length;
+      analytics.successRate = analytics.totalSigned > 0 ? (analytics.totalSigned - analytics.totalFailed) / analytics.totalSigned : 0;
+      analytics.averageGasCost = Object.values(state.gasEstimates).reduce((sum, cost) => sum + cost, 0) / (Object.keys(state.gasEstimates).length || 1);
+      analytics.highValueTxCount = signedTxs.filter(tx => {
+        const metadata = agent['actionHistory']['sign'].find(action => action.action === tx)?.metadata;
+        return metadata && metadata.value >= 0.5; // High-value threshold
+      }).length;
+
+      agent['analytics'] = analytics;
+      logger.info(`Agent ${agent.getId()} (signer) updated analytics: ${JSON.stringify(analytics)}`);
+    } catch (error) {
+      logger.error(`Agent ${agent.getId()} (signer) failed to update analytics: ${error.message}`);
+    }
+  },
+};
+
+export function createSignerAgent(
+  id: number,
+  priority: number = 0,
+  useNN: boolean = false,
+  personality: SignerPersonality = { riskAversion: 0.5, cooperationLevel: 0.5, transactionThreshold: 0.1, latencySensitivity: 0.5 }
+): AIAgent {
+  const decisionModel = async (agent: AIAgent, env: Record<string, any>, agents: AIAgent[]): Promise<string> => {
+    try {
+      const state: SignerState = agent['state'].signerState || {
+        lastTxHash: null,
+        pendingTransactions: [],
+        peerActivity: {},
+        transactionVolume: 0,
+        cooperationScore: 0,
+        gasEstimates: {},
+        successRate: 0,
+      };
+      const personality: SignerPersonality = agent['personality'] || {
+        riskAversion: 0.5,
+        cooperationLevel: 0.5,
+        transactionThreshold: 0.1,
+        latencySensitivity: 0.5,
+      };
+
+      // Fetch transaction to sign from environment
+      const tx = env.transactions?.[0] || { to: '0x123...', value: '0.1' };
+      const txValue = parseFloat(tx.value);
+
+      // Check transaction threshold
+      if (txValue < personality.transactionThreshold) {
+        agent['recordAction'](env.step || 0, 'sign_reject', ActionOutcome.Success, { reason: 'below threshold', value: txValue }, 'sign');
+        return 'sign_reject_below_threshold';
+      }
+
+      // Compute peer activity ratio
+      const peerActivityRatio = Object.values(state.peerActivity).reduce((sum, val) => sum + val, 0) / (Object.keys(state.peerActivity).length || 1);
+
+      // Use Julia for weighted
