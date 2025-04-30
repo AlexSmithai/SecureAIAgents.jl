@@ -1,104 +1,121 @@
-import { ethers } from 'ethers';
-import * as solanaWeb3 from '@solana/web3.js';
+import Web3 from 'web3';
 import { logger } from '../tools/logger';
-import { blockchainClient, BlockchainConfig } from './blockchain';
 
-// Cross-chain event structure
-interface ChainEvent {
-  chain: string;
-  type: 'vote' | 'trade' | 'transfer';
-  data: any;
-  timestamp: number;
+// Supported chains
+type SupportedChain = 'ethereum' | 'solana' | 'near';
+
+// Web3 provider configuration
+interface Web3ProviderConfig {
+  chain: SupportedChain;
+  rpcUrl: string;
 }
 
-// Transaction analytics
-interface TransactionAnalytics {
-  successRate: number;
-  averageGasCost: number;
-  totalTransactions: number;
-  chainActivity: Record<string, number>;
-}
-
+// Web3 utility class
 export class Web3Tools {
-  private eventListeners: Record<string, (event: ChainEvent) => void>;
-  private analytics: TransactionAnalytics;
+  private providers: Record<SupportedChain, Web3> = {
+    ethereum: new Web3('https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID'),
+    solana: new Web3('https://api.mainnet-beta.solana.com'),
+    near: new Web3('https://rpc.mainnet.near.org'),
+  };
 
-  constructor() {
-    this.eventListeners = {};
-    this.analytics = {
-      successRate: 0,
-      averageGasCost: 0,
-      totalTransactions: 0,
-      chainActivity: {},
-    };
+  constructor(configs: Web3ProviderConfig[]) {
+    configs.forEach(({ chain, rpcUrl }) => {
+      this.providers[chain] = new Web3(rpcUrl);
+      logger.info(`Initialized Web3 provider for ${chain} at ${rpcUrl}`);
+    });
   }
 
-  async setupEventListener(config: BlockchainConfig, eventType: 'vote' | 'trade' | 'transfer', callback: (event: ChainEvent) => void): Promise<void> {
+  // Encode transaction data
+  async encodeTransaction(
+    chain: SupportedChain,
+    to: string,
+    value: string,
+    data: string = ''
+  ): Promise<string> {
     try {
-      const chain = config.chain;
-      this.eventListeners[`${chain}:${eventType}`] = callback;
+      const web3 = this.providers[chain];
+      if (!web3) throw new Error(`Unsupported chain: ${chain}`);
 
-      if (chain === 'ethereum') {
-        const wallet = blockchainClient.getWallet(chain) as ethers.Wallet;
-        const contractAddress = '0x789...'; // Simulated contract
-        const contract = new ethers.Contract(contractAddress, ['event VoteCast(uint256 proposalId, bool vote)', 'event TradeExecuted(address token, uint256 amount)'], wallet.provider);
-        if (eventType === 'vote') {
-          contract.on('VoteCast', (proposalId, vote, event) => {
-            callback({ chain, type: 'vote', data: { proposalId, vote }, timestamp: Date.now() });
-            logger.info(`Ethereum vote event: ${proposalId}, ${vote}`);
-          });
-        } else if (eventType === 'trade') {
-          contract.on('TradeExecuted', (token, amount, event) => {
-            callback({ chain, type: 'trade', data: { token, amount }, timestamp: Date.now() });
-            logger.info(`Ethereum trade event: ${token}, ${amount}`);
-          });
-        }
-      } else if (chain === 'solana') {
-        const connection = new solanaWeb3.Connection(config.providerUrl, 'confirmed');
-        // Simulated event listening (Solana uses program logs)
-        connection.onLogs('all', (logs) => {
-          if (logs.logs.some(log => log.includes(eventType))) {
-            callback({ chain, type: eventType, data: logs, timestamp: Date.now() });
-            logger.info(`Solana ${eventType} event: ${JSON.stringify(logs)}`);
-          }
-        });
-      } else if (chain === 'near') {
-        // NEAR event listening (simulated)
-        logger.info(`NEAR event listener setup for ${eventType} (simulated)`);
-      }
+      const tx = { to, value: web3.utils.toWei(value, 'ether'), data };
+      const encoded = web3.eth.abi.encodeParameters(['address', 'uint256', 'bytes'], [to, tx.value, tx.data]);
+      logger.debug(`Encoded transaction for ${chain}: ${encoded}`);
+      return encoded;
     } catch (error) {
-      logger.error(`Failed to setup event listener for ${config.chain} (${eventType}): ${error.message}`);
-    }
-  }
-
-  async mapCrossChainData(sourceChain: string, targetChain: string, data: any): Promise<any> {
-    try {
-      // Simulated cross-chain data mapping
-      const mappedData = { ...data, sourceChain, targetChain, mappedAt: Date.now() };
-      logger.info(`Mapped data from ${sourceChain} to ${targetChain}: ${JSON.stringify(mappedData)}`);
-      return mappedData;
-    } catch (error) {
-      logger.error(`Failed to map cross-chain data from ${sourceChain} to ${targetChain}: ${error.message}`);
+      logger.error(`Failed to encode transaction for ${chain}: ${error.message}`);
       throw error;
     }
   }
 
-  updateTransactionAnalytics(chain: string, txHash: string, gasCost: number, success: boolean): void {
+  // Estimate gas for a transaction
+  async estimateGas(
+    chain: SupportedChain,
+    from: string,
+    to: string,
+    value: string,
+    data: string = ''
+  ): Promise<number> {
     try {
-      this.analytics.totalTransactions++;
-      this.analytics.chainActivity[chain] = (this.analytics.chainActivity[chain] || 0) + 1;
-      const successes = success ? 1 : 0;
-      this.analytics.successRate = (this.analytics.successRate * (this.analytics.totalTransactions - 1) + successes) / this.analytics.totalTransactions;
-      this.analytics.averageGasCost = (this.analytics.averageGasCost * (this.analytics.totalTransactions - 1) + gasCost) / this.analytics.totalTransactions;
-      logger.info(`Updated transaction analytics: successRate=${this.analytics.successRate}, avgGasCost=${this.analytics.averageGasCost}`);
+      const web3 = this.providers[chain];
+      if (!web3) throw new Error(`Unsupported chain: ${chain}`);
+
+      const gas = await web3.eth.estimateGas({
+        from,
+        to,
+        value: web3.utils.toWei(value, 'ether'),
+        data,
+      });
+      logger.debug(`Estimated gas for ${chain} transaction: ${gas}`);
+      return gas;
     } catch (error) {
-      logger.error(`Failed to update transaction analytics: ${error.message}`);
+      logger.error(`Failed to estimate gas for ${chain}: ${error.message}`);
+      return 21000; // Default gas for simple transfers
     }
   }
 
-  getAnalytics(): TransactionAnalytics {
-    return this.analytics;
+  // Listen for events on a contract
+  async listenForEvents(
+    chain: SupportedChain,
+    contractAddress: string,
+    eventName: string,
+    callback: (event: any) => void
+  ): Promise<void> {
+    try {
+      const web3 = this.providers[chain];
+      if (!web3) throw new Error(`Unsupported chain: ${chain}`);
+
+      const contract = new web3.eth.Contract([], contractAddress);
+      contract.events[eventName]()
+        .on('data', (event: any) => {
+          logger.info(`Event ${eventName} on ${chain} at ${contractAddress}: ${JSON.stringify(event)}`);
+          callback(event);
+        })
+        .on('error', (error: Error) => {
+          logger.error(`Event listener error for ${eventName} on ${chain}: ${error.message}`);
+        });
+    } catch (error) {
+      logger.error(`Failed to set up event listener for ${chain}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  // Convert value between units (e.g., wei to ether)
+  convertUnits(chain: SupportedChain, value: string, fromUnit: string, toUnit: string): string {
+    try {
+      const web3 = this.providers[chain];
+      if (!web3) throw new Error(`Unsupported chain: ${chain}`);
+
+      const converted = web3.utils.fromWei(value, toUnit as any);
+      logger.debug(`Converted ${value} from ${fromUnit} to ${toUnit}: ${converted}`);
+      return converted;
+    } catch (error) {
+      logger.error(`Failed to convert units for ${chain}: ${error.message}`);
+      return value;
+    }
   }
 }
 
-export const web3Tools = new Web3Tools();
+export const web3Tools = new Web3Tools([
+  { chain: 'ethereum', rpcUrl: 'https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID' },
+  { chain: 'solana', rpcUrl: 'https://api.mainnet-beta.solana.com' },
+  { chain: 'near', rpcUrl: 'https://rpc.mainnet.near.org' },
+]);
