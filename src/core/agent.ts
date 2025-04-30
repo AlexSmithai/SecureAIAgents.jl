@@ -4,6 +4,7 @@ import { mcpClient, MCPResponse } from '../web3/mcpClient';
 import { callTEESecureFunction } from '../tools/tee';
 import { logger } from '../tools/logger';
 import { RLEngine } from '../engine/rlEngine';
+import { commProtocol, AgentMessage, MessageType } from '../communication/protocol';
 
 // Neural network model for RL
 export class NeuralNetModel {
@@ -74,7 +75,7 @@ export class NeuralNetModel {
   }
 }
 
-// Core agent class
+// Core agent class with communication capabilities
 export class AIAgent {
   private id: number;
   public role: AgentRole;
@@ -87,7 +88,9 @@ export class AIAgent {
   private plugins: AgentPlugin[];
   public rlEngine: RLEngine;
   public lastReward: number;
-  public personality: any; // Role-specific personality traits
+  public personality: any;
+  private receivedMessages: AgentMessage[];
+  private communicationInfluence: Map<number, number>;
 
   constructor(
     id: number,
@@ -112,106 +115,16 @@ export class AIAgent {
     this.rlEngine = new RLEngine();
     this.lastReward = 0;
     this.personality = null;
+    this.receivedMessages = [];
+    this.communicationInfluence = new Map();
+    this.setupCommunicationListeners();
     logger.info(`Agent ${this.id} initialized as ${role} with priority ${this.priority}`);
   }
 
-  getId(): number {
-    return this.id;
-  }
-
-  getRole(): AgentRole {
-    return this.role;
-  }
-
-  getPriority(): number {
-    return this.priority;
-  }
-
-  updatePriority(newPriority: number): void {
-    try {
-      this.priority = newPriority;
-      logger.info(`Agent ${this.id} priority updated to ${newPriority}`);
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to update priority: ${error.message}`);
-    }
-  }
-
-  recordAction(step: number, action: boolean | string, outcome: ActionOutcome, metadata: Record<string, any> = {}, type: 'vote' | 'sign' | 'read' | 'trade' | 'decision' = 'decision'): void {
-    try {
-      const agentAction: AgentAction = { step, action, outcome, metadata };
-      this.actionHistory[type].push(agentAction);
-      if (this.actionHistory[type].length > 100) {
-        this.actionHistory[type].shift();
-      }
-      logger.debug(`Agent ${this.id} recorded ${type} action: ${JSON.stringify(agentAction)}`);
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to record action: ${error.message}`);
-    }
-  }
-
-  getHistoricalActions(type: 'vote' | 'sign' | 'read' | 'trade' | 'decision'): (boolean | string)[] {
-    return this.actionHistory[type].map(action => action.action);
-  }
-
-  async fetchMCPContext(chain: string, type: string, params: any): Promise<void> {
-    try {
-      if (type === 'votes' || type === 'transactions') {
-        this.mcpContext[type] = await mcpClient.fetchHistoricalData(chain, type, params);
-      } else if (type === 'market') {
-        this.mcpContext[type] = await mcpClient.fetchMarketData(chain, params.token);
-      } else if (type === 'proposals') {
-        this.mcpContext[type] = await mcpClient.fetchGovernanceProposals(chain, params.contractAddress);
-      }
-      logger.info(`Agent ${this.id} fetched MCP context for ${type}`);
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to fetch MCP context for ${type}: ${error.message}`);
-    }
-  }
-
-  secureDecision(decision: string): string {
-    try {
-      const secureDecision = callTEESecureFunction(decision);
-      logger.info(`Agent ${this.id} secured decision: ${secureDecision}`);
-      return secureDecision;
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to secure decision: ${error.message}`);
-      return decision;
-    }
-  }
-
-  async step(env: Record<string, any>, agents: AIAgent[]): Promise<void> {
-    try {
-      // Run plugins' onStep hooks
-      for (const plugin of this.plugins) {
-        if (plugin.onStep) {
-          await plugin.onStep(this, env, agents);
-        }
-      }
-
-      // Execute decision model
-      const decision = await this.decisionModel(this, env, agents);
-      logger.debug(`Agent ${this.id} made decision: ${decision}`);
-
-      // Run plugins' onDecision hooks
-      for (const plugin of this.plugins) {
-        if (plugin.onDecision) {
-          await plugin.onDecision(this, decision);
-        }
-      }
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to execute step: ${error.message}`);
-    }
-  }
-
-  getAgentStats(): { actions: number; successRate: number; priority: number } {
-    try {
-      const allActions = Object.values(this.actionHistory).flat();
-      const totalActions = allActions.length;
-      const successRate = totalActions > 0 ? allActions.filter(a => a.outcome === 'success').length / totalActions : 0;
-      return { actions: totalActions, successRate, priority: this.priority };
-    } catch (error) {
-      logger.error(`Agent ${this.id} failed to compute stats: ${error.message}`);
-      return { actions: 0, successRate: 0, priority: this.priority };
-    }
-  }
-}
+  private setupCommunicationListeners(): void {
+    // Listener for state updates
+    commProtocol.registerListener(MessageType.StateUpdate, async (msg: AgentMessage) => {
+      if (msg.senderId !== this.id) {
+        this.communicationInfluence.set(msg.senderId, (this.communicationInfluence.get(msg.senderId) || 0) + 0.1);
+        this.receivedMessages.push(msg);
+        logger.debug(`Agent ${this.id}
