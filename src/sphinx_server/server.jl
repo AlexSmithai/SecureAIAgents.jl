@@ -1,40 +1,54 @@
-using Sockets
+import express from 'express';
+import { AIAgent } from '../core/agent';
+import { analyzeEmergentBehavior } from '../engine/engine';
 
-function run_server(port::Int=8080)
-    server = listen(port)
-    println("Sphinx server running on port $port...")
-    
-    while true
-        sock = accept(server)
-        @async begin
-            try
-                line = readline(sock)
-                if startswith(line, "GET /status")
-                    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nSphinx AI Agents Running"
-                    write(sock, response)
-                elseif startswith(line, "GET /start")
-                    env = create_blockchain_env(2)
-                    agents = [
-                        create_voter_agent(1, true),
-                        create_signer_agent(2)
-                    ]
-                    for step in 1:5
-                        for agent in agents
-                            step!(agent, env)
-                        end
-                        update_environment!(env, agents)
-                    end
-                    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nAgents Started"
-                    write(sock, response)
-                else
-                    response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found"
-                    write(sock, response)
-                end
-            catch e
-                println("Server error: $e")
-            finally
-                close(sock)
-            end
-        end
-    end
-end
+const app = express();
+app.use(express.json());
+
+let agents: AIAgent[] = [];
+let env: Record<string, any> = {};
+
+app.post('/agents', (req, res) => {
+  const { id, role, priority, useNN } = req.body;
+  const agent = new AIAgent(id, role, async (agent: AIAgent, env: Record<string, any>) => {
+    // Simplified decision model for server
+    return true;
+  }, useNN || false, priority || 0);
+  agents.push(agent);
+  res.status(201).json({ message: `Agent ${id} created`, agent });
+});
+
+app.get('/agents/:id', (req, res) => {
+  const agent = agents.find(a => a.id === parseInt(req.params.id));
+  if (agent) {
+    res.json(agent);
+  } else {
+    res.status(404).json({ message: 'Agent not found' });
+  }
+});
+
+// New: Expose emergent behavior metrics
+app.get('/emergent-behavior', async (req, res) => {
+  const emergentBehavior = await analyzeEmergentBehavior(agents);
+  res.json(emergentBehavior);
+});
+
+// New: Expose agent history
+app.get('/agents/:id/history', (req, res) => {
+  const agent = agents.find(a => a.id === parseInt(req.params.id));
+  if (agent) {
+    res.json(agent.actionHistory);
+  } else {
+    res.status(404).json({ message: 'Agent not found' });
+  }
+});
+
+app.post('/run', async (req, res) => {
+  const { steps } = req.body;
+  await runAgents(agents, env, steps || 1);
+  res.json({ message: `Ran ${steps} steps` });
+});
+
+app.listen(3000, () => {
+  console.log('Server running on http://localhost:3000');
+});
